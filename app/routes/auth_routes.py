@@ -1,9 +1,11 @@
 # app/routes/auth_routes.py
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
 from app.extensions import db
 from app.models import User, UserRole, CatererProfile, CustomerProfile
 from flask_jwt_extended import create_access_token, create_refresh_token, jwt_required, get_jwt_identity
 from app.extensions import jwt
+from app.utils.google_oauth import GoogleOAuth
+import json
 
 auth_bp = Blueprint("auth", __name__)
 
@@ -233,3 +235,70 @@ def me():
         result["address"] = user.customer_profile.address
 
     return jsonify(result), 200
+
+
+# Add these routes to your auth_bp
+
+@auth_bp.route('/google/login', methods=['POST'])
+def google_login():
+    """
+    Login or register with Google OAuth
+    Expected JSON:
+    {
+        "token": "google_id_token",
+        "role": "client"  // or "caterer"
+    }
+    """
+    try:
+        data = request.get_json()
+
+        if not data or 'token' not in data:
+            return jsonify({'error': 'Google token is required'}), 400
+
+        token = data['token']
+        role = data.get('role', 'client')  # Default to client
+
+        # Validate role
+        if role not in ['client', 'caterer']:
+            return jsonify({'error': 'Invalid role. Must be "client" or "caterer"'}), 400
+
+        # Verify Google token
+        user_info, error = GoogleOAuth.verify_google_token(token)
+
+        if error:
+            return jsonify({'error': error}), 401
+
+        # Find or create user
+        user, is_new_user = GoogleOAuth.find_or_create_user(user_info, role)
+
+        # Create JWT tokens
+        access_token = create_access_token(identity=user.id)
+        refresh_token = create_refresh_token(identity=user.id)
+
+        response_data = {
+            'message': 'User registered successfully' if is_new_user else 'Login successful',
+            'access_token': access_token,
+            'refresh_token': refresh_token,
+            'user': {
+                'id': user.id,
+                'email': user.email,
+                'role': user.role.value,
+                'is_new_user': is_new_user
+            }
+        }
+
+        return jsonify(response_data), 201 if is_new_user else 200
+
+    except Exception as e:
+        current_app.logger.error(f'Google OAuth error: {str(e)}')
+        return jsonify({'error': 'Authentication failed'}), 500
+
+
+@auth_bp.route('/google/client-id', methods=['GET'])
+def get_google_client_id():
+    """
+    Get Google Client ID for frontend
+    """
+    return jsonify({
+        'client_id': current_app.config['GOOGLE_CLIENT_ID']
+    }), 200
