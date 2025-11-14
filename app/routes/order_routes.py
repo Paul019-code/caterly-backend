@@ -2,6 +2,8 @@
 from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from sqlalchemy import or_, and_
+# Add these imports at the top if not already present
+from sqlalchemy.orm import joinedload
 import uuid
 from datetime import datetime
 
@@ -534,3 +536,351 @@ def order_details(order_id):
 # - update_order_status
 # - update_order
 # - get_order_stats
+
+
+# CART MANAGEMENT ENDPOINTS
+@order_bp.route('/cart/add', methods=['POST'])
+@jwt_required()
+def add_to_cart():
+    """
+    Add menu item to cart (pending order)
+    {
+        "menu_item_id": 1,
+        "quantity": 2,
+        "customization": "No onions",
+        "servings_per_unit": 1  # For catering orders
+    }
+    """
+    try:
+        current_user_id = get_jwt_identity()
+        data = request.get_json()
+
+        if 'menu_item_id' not in data:
+            return jsonify({'error': 'menu_item_id is required'}), 400
+
+        # Get menu item
+        menu_item = MenuItem.query.filter_by(
+            id=data['menu_item_id'],
+            is_active=True
+        ).first()
+
+        if not menu_item:
+            return jsonify({'error': 'Menu item not found or not available'}), 404
+
+        # Find or create pending order (cart)
+        pending_order = Order.query.filter_by(
+            client_id=current_user_id,
+            status=OrderStatus.DRAFT
+        ).first()
+
+        if not pending_order:
+            pending_order = Order(
+                order_number=generate_order_number(),
+                client_id=current_user_id,
+                caterer_id=menu_item.caterer_id,
+                total_amount=0,
+                estimated_total=0,
+                status=OrderStatus.DRAFT
+            )
+            db.session.add(pending_order)
+            db.session.flush()
+
+        # Check if item already in cart
+        existing_item = OrderItem.query.filter_by(
+            order_id=pending_order.id,
+            menu_item_id=data['menu_item_id'],
+            customization=data.get('customization', '')
+        ).first()
+
+        if existing_item:
+            existing_item.quantity += data.get('quantity', 1)
+        else:
+            # Add new item to cart
+            order_item = OrderItem(
+                order_id=pending_order.id,
+                menu_item_id=data['menu_item_id'],
+                quantity=data.get('quantity', 1),
+                unit_price=menu_item.price,
+                customization=data.get('customization', ''),
+                servings_per_unit=data.get('servings_per_unit', 1),
+                special_instructions=data.get('special_instructions', '')
+            )
+            db.session.add(order_item)
+
+        # Update order totals
+        pending_order.total_amount = sum(
+            float(item.unit_price) * item.quantity for item in pending_order.order_items
+        )
+        pending_order.estimated_total = pending_order.total_amount
+
+        db.session.commit()
+
+        return jsonify({
+            'success': True,
+            'message': 'Item added to cart',
+            'cart_count': sum(item.quantity for item in pending_order.order_items),
+            'order_total': float(pending_order.total_amount)
+        }), 200
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f'Error adding to cart: {str(e)}')
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+@order_bp.route('/cart', methods=['GET'])
+@jwt_required()
+def get_cart():
+    """
+    Get current user's cart (pending order)
+    """
+    try:
+        current_user_id = get_jwt_identity()
+
+        pending_order = Order.query.filter_by(
+            client_id=current_user_id,
+            status=OrderStatus.DRAFT
+        ).options(
+            joinedload(Order.order_items).joinedload(OrderItem.menu_item)
+        ).first()
+
+        if not pending_order:
+            return jsonify({
+                'items': [],
+                'total': 0,
+                'cart_count': 0,
+                'caterer_id': None
+            }), 200
+
+        cart_items = []
+        for item in pending_order.order_items:
+            menu_item = item.menu_item
+            cart_items.append({
+                'id': item.id,
+                'menu_item_id': item.menu_item_id,
+                'name': menu_item.name,
+                'description': menu_item.description,
+                'price': float(item.unit_price),
+                'quantity': item.quantity,
+                'customization': item.customization,
+                'servings_per_unit': item.servings_per_unit,
+                'special_instructions': item.special_instructions,
+                'image_url': menu_item.image_url,
+                'subtotal': float(item.unit_price * item.quantity),
+                'total_servings': item.total_servings()
+            })
+
+        return jsonify({
+            'order_id': pending_order.id,
+            'items': cart_items,
+            'total': float(pending_order.total_amount),
+            'cart_count': sum(item.quantity for item in pending_order.order_items),
+            'caterer_id': pending_order.caterer_id,
+            'caterer_business_name': pending_order.caterer.business_name if pending_order.caterer else None
+        }), 200
+
+    except Exception as e:
+        current_app.logger.error(f'Error getting cart: {str(e)}')
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+@order_bp.route('/cart/update', methods=['POST'])
+@jwt_required()
+def update_cart_item():
+    """
+    Update cart item quantity or remove item
+    {
+        "item_id": 1,
+        "quantity": 3  // set to 0 to remove
+    }
+    """
+    try:
+        current_user_id = get_jwt_identity()
+        data = request.get_json()
+
+        if 'item_id' not in data or 'quantity' not in data:
+            return jsonify({'error': 'item_id and quantity are required'}), 400
+
+        # Find the order item
+        order_item = OrderItem.query.join(Order).filter(
+            OrderItem.id == data['item_id'],
+            Order.client_id == current_user_id,
+            Order.status == OrderStatus.DRAFT
+        ).first()
+
+        if not order_item:
+            return jsonify({'error': 'Cart item not found'}), 404
+
+        if data['quantity'] <= 0:
+            # Remove item from cart
+            db.session.delete(order_item)
+        else:
+            # Update quantity
+            order_item.quantity = data['quantity']
+
+        # Update order totals
+        order = order_item.order
+        order.total_amount = sum(
+            float(item.unit_price) * item.quantity for item in order.order_items
+        )
+        order.estimated_total = order.total_amount
+
+        db.session.commit()
+
+        return jsonify({
+            'success': True,
+            'message': 'Cart updated successfully',
+            'order_total': float(order.total_amount),
+            'cart_count': sum(item.quantity for item in order.order_items)
+        }), 200
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f'Error updating cart: {str(e)}')
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+@order_bp.route('/cart/clear', methods=['POST'])
+@jwt_required()
+def clear_cart():
+    """
+    Clear all items from cart
+    """
+    try:
+        current_user_id = get_jwt_identity()
+
+        pending_order = Order.query.filter_by(
+            client_id=current_user_id,
+            status=OrderStatus.DRAFT
+        ).first()
+
+        if pending_order:
+            # Delete all order items
+            OrderItem.query.filter_by(order_id=pending_order.id).delete()
+            pending_order.total_amount = 0
+            pending_order.estimated_total = 0
+            db.session.commit()
+
+        return jsonify({
+            'success': True,
+            'message': 'Cart cleared successfully'
+        }), 200
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f'Error clearing cart: {str(e)}')
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+@order_bp.route('/cart/convert-to-order', methods=['POST'])
+@jwt_required()
+def convert_cart_to_order():
+    """
+    Convert cart (draft order) to pending order with additional details
+    For regular orders:
+    {
+        "order_type": "regular",
+        "delivery_location": "123 Main St",
+        "dietary_requirements": ["vegetarian"],
+        "client_info": {
+            "full_name": "John Doe",
+            "email": "john@example.com",
+            "phone_number": "123-456-7890"
+        },
+        "notes": "Additional instructions"
+    }
+
+    For catering orders:
+    {
+        "order_type": "catering",
+        "event_name": "Company Meeting",
+        "event_date": "2025-11-15",
+        "event_time": "12:00",
+        "delivery_location": "123 Main St",
+        "guest_count": 50,
+        "special_requirements": ["vegetarian"],
+        "client_info": {
+            "full_name": "John Doe",
+            "email": "john@example.com",
+            "phone_number": "123-456-7890"
+        },
+        "notes": "Catering instructions"
+    }
+    """
+    try:
+        current_user_id = get_jwt_identity()
+        data = request.get_json()
+
+        # Find draft order
+        draft_order = Order.query.filter_by(
+            client_id=current_user_id,
+            status=OrderStatus.DRAFT
+        ).first()
+
+        if not draft_order or not draft_order.order_items.count():
+            return jsonify({'error': 'Cart is empty'}), 400
+
+        order_type = data.get('order_type', 'regular')
+
+        # Build comprehensive notes
+        client_info = data.get('client_info', {})
+        if order_type == 'regular':
+            notes_parts = [
+                f"CLIENT: {client_info.get('full_name', '')}",
+                f"EMAIL: {client_info.get('email', '')}",
+                f"PHONE: {client_info.get('phone_number', '')}",
+                f"DELIVERY: {data.get('delivery_location', '')}",
+                f"DIETARY: {', '.join(data.get('dietary_requirements', []))}",
+                f"NOTES: {data.get('notes', '')}"
+            ]
+            notes = "\n".join([part for part in notes_parts if part.split(': ')[1]])
+        else:
+            # Catering order
+            notes_parts = [
+                f"EVENT: {data.get('event_name', '')}",
+                f"DATE: {data.get('event_date', '')} at {data.get('event_time', '')}",
+                f"GUESTS: {data.get('guest_count', '')}",
+                f"DELIVERY: {data.get('delivery_location', '')}",
+                f"CLIENT: {client_info.get('full_name', '')}",
+                f"EMAIL: {client_info.get('email', '')}",
+                f"PHONE: {client_info.get('phone_number', '')}",
+                f"REQUIREMENTS: {', '.join(data.get('special_requirements', []))}",
+                f"NOTES: {data.get('notes', '')}"
+            ]
+            notes = "\n".join([part for part in notes_parts if part.split(': ')[1]])
+
+        # Update order with final details
+        draft_order.notes = notes
+        draft_order.status = OrderStatus.PENDING
+
+        # Add catering-specific fields
+        if order_type == 'catering':
+            draft_order.event_name = data.get('event_name')
+            draft_order.event_date = datetime.strptime(data['event_date'], '%Y-%m-%d').date() if data.get(
+                'event_date') else None
+            draft_order.event_time = datetime.strptime(data['event_time'], '%H:%M').time() if data.get(
+                'event_time') else None
+            draft_order.delivery_address = data.get('delivery_location', '')
+            draft_order.guest_count = data.get('guest_count')
+            draft_order.special_requirements = data.get('special_requirements', [])
+            # Update order number for catering
+            draft_order.order_number = generate_catering_order_number()
+
+        db.session.commit()
+
+        return jsonify({
+            'success': True,
+            'message': 'Order submitted successfully',
+            'order': {
+                'id': draft_order.id,
+                'order_number': draft_order.order_number,
+                'order_type': order_type,
+                'total_amount': float(draft_order.total_amount),
+                'status': draft_order.status.value
+            }
+        }), 200
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f'Error converting cart to order: {str(e)}')
+        return jsonify({'error': 'Internal server error'}), 500

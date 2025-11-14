@@ -151,8 +151,9 @@
 # app/models.py
 from .extensions import db
 from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import datetime
+from datetime import datetime, timedelta  # ADD timedelta here ✅
 import enum
+import uuid  # ADD THIS IMPORT
 from sqlalchemy.dialects.postgresql import JSON
 
 
@@ -165,10 +166,30 @@ class UserRole(enum.Enum):
 class User(db.Model):
     __tablename__ = "users"
     id = db.Column(db.Integer, primary_key=True)
+    public_id = db.Column(db.String(100), unique=True, default=lambda: str(uuid.uuid4()))  # ADD THIS LINE
     email = db.Column(db.String(120), unique=True, nullable=False, index=True)
     password_hash = db.Column(db.String(255), nullable=False)
     role = db.Column(db.Enum(UserRole), nullable=False, default=UserRole.CLIENT)
     phone_number = db.Column(db.String(20))
+    # created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    #
+    # caterer_profile = db.relationship("CatererProfile", back_populates="user", uselist=False)
+    # customer_profile = db.relationship("CustomerProfile", back_populates="user", uselist=False)
+    # orders = db.relationship("Order", back_populates="client", lazy="dynamic")
+    #
+    # def set_password(self, password):
+    #     self.password_hash = generate_password_hash(password)
+    #
+    # def check_password(self, password):
+    #     return check_password_hash(self.password_hash, password)
+
+    # ADD THESE SECURITY FIELDS:
+    failed_login_attempts = db.Column(db.Integer, default=0)
+    account_locked_until = db.Column(db.DateTime, nullable=True)
+    last_login = db.Column(db.DateTime)
+    is_verified = db.Column(db.Boolean, default=False)  # For email verification
+    verification_token = db.Column(db.String(100), nullable=True)
+
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     caterer_profile = db.relationship("CatererProfile", back_populates="user", uselist=False)
@@ -180,6 +201,26 @@ class User(db.Model):
 
     def check_password(self, password):
         return check_password_hash(self.password_hash, password)
+
+    def is_account_locked(self):
+        """Check if account is temporarily locked due to failed logins"""
+        if self.account_locked_until:
+            return datetime.utcnow() < self.account_locked_until
+        return False
+
+    def increment_failed_login(self):
+        """Increment failed login attempts and lock account if needed"""
+        self.failed_login_attempts += 1
+        if self.failed_login_attempts >= 5:  # Lock after 5 failed attempts
+            self.account_locked_until = datetime.utcnow() + timedelta(minutes=30)  # 30 minute lock ✅
+        return self
+
+    def reset_failed_logins(self):
+        """Reset failed login attempts (called on successful login)"""
+        self.failed_login_attempts = 0
+        self.account_locked_until = None
+        self.last_login = datetime.utcnow()
+        return self
 
 
 class CustomerProfile(db.Model):
@@ -292,6 +333,11 @@ class Order(db.Model):
     def is_catering_order(self):
         """Check if this is a catering order (has event details)"""
         return bool(self.event_name and self.event_date and self.guest_count)
+
+    # In your Order class, add this method:
+    def get_cart_count(self):
+        """Get total quantity of items in order (for cart)"""
+        return sum(item.quantity for item in self.order_items) if self.order_items else 0
 
 
 # ENHANCED OrderItem model with catering features
